@@ -1,0 +1,7 @@
+name: slurm-batch-hello
+command: "echo HELLO_FROM_SLURM; sleep 15; echo SLURM_DONE"
+workload_class: batch
+resources:
+  cpu: 1
+  memory_mb: 128
+  ntasks: 1

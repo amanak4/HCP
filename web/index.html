@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hybrid Compute Platform</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #121a2b;
+      --panel-2: #182238;
+      --line: #2a3a58;
+      --text: #e8eefc;
+      --muted: #9db0d0;
+      --accent: #3ee0c5;
+      --good: #3ddc97;
+      --bad: #ff6b6b;
+      --warn: #f7c948;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #16324f 0%, var(--bg) 45%);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      flex: 0 0 auto;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: 12px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      background: rgba(11, 18, 32, .94);
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { font-size: 18px; margin: 0; }
+    h3 { margin: 0 0 10px; font-size: 15px; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    main {
+      flex: 1;
+      min-height: 0;
+      padding: 12px 20px 16px;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 12px;
+    }
+    .health {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+    }
+    .cluster { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .pill {
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .up { background: rgba(61, 220, 151, .15); color: var(--good); }
+    .down { background: rgba(255, 107, 107, .15); color: var(--bad); }
+    .meta { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.45; }
+    .banner {
+      display: none;
+      margin-bottom: 8px;
+      align-items: center;
+      gap: 10px;
+    }
+    .banner.show { display: flex; }
+    .banner strong { font-size: 13px; }
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.85fr);
+      gap: 12px;
+    }
+    .jobs-panel, .submit-panel {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .jobs-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .jobs-scroll {
+      min-height: 0;
+      flex: 1;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    form { display: grid; gap: 8px; }
+    .submit-panel form { overflow: auto; }
+    label { font-size: 11px; color: var(--muted); }
+    input, select, textarea {
+      width: 100%;
+      background: #0d1526;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font: inherit;
+    }
+    textarea { min-height: 56px; resize: vertical; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      background: var(--accent);
+      color: #06221c;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    button.danger { background: transparent; color: #ffb4b4; border: 1px solid #6a3030; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: #15233b; }
+    tr.flash { animation: flash 1.6s ease; }
+    @keyframes flash {
+      0% { background: rgba(62, 224, 197, .22); }
+      100% { background: transparent; }
+    }
+    .kubernetes { color: #9cbcff; }
+    .slurm { color: #ffd36a; }
+    .status-running { color: var(--accent); }
+    .status-succeeded { color: var(--good); }
+    .status-failed, .status-cancelled { color: var(--bad); }
+    .status-pending, .status-accepted { color: var(--warn); }
+    .status-pill {
+      display: inline-block;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .reason { color: var(--muted); font-size: 12px; }
+    .job-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 30;
+      background: #15233b;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 14px;
+      max-width: 380px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      display: none;
+    }
+    .toast.show { display: block; }
+    .drawer-back {
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 8, 16, .55);
+      z-index: 20;
+      display: none;
+    }
+    .drawer-back.open { display: block; }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(520px, 100vw);
+      height: 100vh;
+      z-index: 21;
+      background: #101827;
+      border-left: 1px solid var(--line);
+      transform: translateX(100%);
+      transition: transform .2s ease;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer header { position: static; }
+    .drawer pre {
+      flex: 1;
+      margin: 0 16px 16px;
+      background: #0a1220;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 720px) {
+      .health, .workspace, .row { grid-template-columns: 1fr; }
+      main { display: block; overflow: auto; }
+      .jobs-scroll { max-height: 360px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Hybrid Compute Platform</h1>
+      <div class="sub">Submit once. The control plane chooses Kubernetes or Slurm.</div>
+    </div>
+    <button class="secondary" type="button" onclick="refreshAll()">Refresh</button>
+  </header>
+  <main>
+    <div class="health">
+      <div class="panel" id="k8s-card">Loading kubernetes…</div>
+      <div class="panel" id="slurm-card">Loading slurm…</div>
+    </div>
+    <div class="workspace">
+      <div class="panel jobs-panel" id="jobs-panel">
+        <div class="jobs-head">
+          <div>
+            <h3>Jobs <span id="job-count" class="sub"></span></h3>
+            <div class="sub">Newest first. The submitted job is highlighted in this list.</div>
+          </div>
+        </div>
+        <div class="panel banner" id="last-submit">
+          <span class="pill up">NEW</span>
+          <div>
+            <strong id="last-submit-title">No job submitted yet</strong>
+            <div class="sub" id="last-submit-sub">After submit, the new job shows here and in the table below.</div>
+          </div>
+        </div>
+        <div class="jobs-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Scheduler</th>
+                <th>Why</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="jobs"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel submit-panel">
+        <h3>Submit workload</h3>
+        <div class="sub" style="margin-bottom:10px">Presets only fill the form. Placement still scores both clusters.</div>
+        <form id="submit-form">
+          <div>
+            <label>Name</label>
+            <input name="name" value="demo-job" required />
+          </div>
+          <div>
+            <label>Command</label>
+            <textarea name="command" required>echo hello; sleep 20; echo done</textarea>
+          </div>
+          <div>
+            <label>Image (used on Kubernetes)</label>
+            <input name="image" value="ubuntu:22.04" />
+          </div>
+          <div>
+            <label>Workload class</label>
+            <select name="workload_class">
+              <option value="batch">batch</option>
+              <option value="service">service</option>
+            </select>
+          </div>
+          <div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            <div>
+              <label>CPU</label>
+              <input name="cpu" type="number" step="0.1" value="1" />
+            </div>
+            <div>
+              <label>Memory MiB</label>
+              <input name="memory_mb" type="number" value="128" />
+            </div>
+          </div>
+          <div>
+            <label>Parallel tasks</label>
+            <input name="ntasks" type="number" value="1" />
+          </div>
+          <div class="actions">
+            <button type="submit" id="submit-btn">Submit</button>
+            <button type="button" class="secondary" onclick="preset('k8s')">Python container</button>
+            <button type="button" class="secondary" onclick="preset('slurm')">Batch</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </main>
+
+  <div class="drawer-back" id="drawer-back" onclick="closeLogs()"></div>
+  <aside class="drawer" id="drawer">
+    <header>
+      <div>
+        <h1>Job logs</h1>
+        <div class="sub" id="log-title">Select a job</div>
+      </div>
+      <button class="secondary" type="button" onclick="closeLogs()">Close</button>
+    </header>
+    <pre id="logs">Click Logs on a job to inspect output here.</pre>
+  </aside>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const api = "";
+    const live = { accepted: true, pending: true, running: true };
+    let lastJobsJson = "";
+    let highlightId = "";
+    async function get(path) {
+      const res = await fetch(api + path);
+      if (!res.ok) throw new Error(await readError(res));
+      return res.json();
+    }
+    async function readError(res) {
+      const text = await res.text();
+      try {
+        const payload = JSON.parse(text);
+        return payload.detail || text;
+      } catch {
+        return text;
+      }
+    }
+    function toast(message) {
+      const el = document.getElementById("toast");
+      el.textContent = message;
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 4200);
+    }
+    function card(inv) {
+      const state = inv.healthy ? "up" : "down";
+      return `
+        <div class="cluster">
+          <strong>${inv.scheduler}</strong>
+          <span class="pill ${state}">${inv.healthy ? "HEALTHY" : "DOWN"}</span>
+        </div>
+        <div class="meta">
+          CPU idle ${Number(inv.cpu_idle).toFixed(1)} · mem ${inv.memory_mb_idle} MiB<br/>
+          running/pending ${inv.running_jobs} / ${inv.pending_jobs}
+          ${inv.message ? `<br/>${inv.message}` : ""}
+        </div>`;
+    }
+    async function refreshClusters() {
+      const data = await get("/api/v1/clusters");
+      const k8s = data.clusters.find(c => c.scheduler === "kubernetes");
+      const slurm = data.clusters.find(c => c.scheduler === "slurm");
+      document.getElementById("k8s-card").innerHTML = k8s ? card(k8s) : "kubernetes missing";
+      document.getElementById("slurm-card").innerHTML = slurm ? card(slurm) : "slurm missing";
+    }
+    function showLastSubmit(job) {
+      const banner = document.getElementById("last-submit");
+      banner.classList.add("show");
+      document.getElementById("last-submit-title").textContent = `${job.name} → ${job.scheduler || "placing…"}`;
+      document.getElementById("last-submit-sub").textContent = `${job.status} · ${job.id}`;
+    }
+    async function refreshJobs() {
+      const jobs = await get("/api/v1/jobs");
+      document.getElementById("job-count").textContent = jobs.length ? `(${jobs.length})` : "";
+      const fingerprint = JSON.stringify(jobs.map((job) => [
+        job.id, job.status, job.scheduler, job.placement_reason, job.message, highlightId,
+      ]));
+      if (fingerprint === lastJobsJson) return jobs;
+      lastJobsJson = fingerprint;
+      const html = jobs.map(job => {
+        const canCancel = Boolean(live[job.status]);
+        const flash = job.id === highlightId ? " flash" : "";
+        return `
+        <tr data-job-id="${job.id}" class="${flash}">
+          <td><code>${job.id}</code></td>
+          <td>${job.name}</td>
+          <td><span class="status-pill status-${job.status}">${job.status}</span></td>
+          <td class="${job.scheduler || ""}">${job.scheduler || "-"}</td>
+          <td class="reason">${job.placement_reason || job.message || ""}</td>
+          <td class="job-actions">
+            <button class="secondary" data-act="logs" data-id="${job.id}">Logs</button>
+            <button class="danger" data-act="cancel" data-id="${job.id}" ${canCancel ? "" : "disabled title=\"Finished jobs cannot be cancelled\""}>Cancel</button>
+          </td>
+        </tr>`;
+      }).join("") || `<tr><td colspan="6" class="reason">No jobs yet. Submit on the right — the new row will show up here.</td></tr>`;
+      document.getElementById("jobs").innerHTML = html;
+      if (highlightId) {
+        const row = document.querySelector(`[data-job-id="${highlightId}"]`);
+        if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+      return jobs;
+    }
+    async function showLogs(id) {
+      document.getElementById("drawer-back").classList.add("open");
+      document.getElementById("drawer").classList.add("open");
+      document.getElementById("log-title").textContent = `Loading ${id}…`;
+      document.getElementById("logs").textContent = "Fetching logs…";
+      try {
+        const data = await get(`/api/v1/jobs/${id}/logs`);
+        document.getElementById("log-title").textContent = `Job ${id} on ${data.scheduler || "unknown"}`;
+        document.getElementById("logs").textContent = data.logs || "(no logs yet — the job may still be starting)";
+      } catch (err) {
+        document.getElementById("log-title").textContent = `Job ${id}`;
+        document.getElementById("logs").textContent = String(err);
+      }
+    }
+    function closeLogs() {
+      document.getElementById("drawer-back").classList.remove("open");
+      document.getElementById("drawer").classList.remove("open");
+    }
+    async function cancelJob(id) {
+      toast(`Cancelling ${id}…`);
+      try {
+        const res = await fetch(`/api/v1/jobs/${id}`, { method: "DELETE" });
+        if (!res.ok) throw new Error(await readError(res));
+        const job = await res.json();
+        toast(`Job ${id} ${job.status}`);
+        await refreshAll();
+      } catch (err) {
+        toast(String(err.message || err));
+      }
+    }
+    function preset(kind) {
+      const form = document.getElementById("submit-form");
+      if (kind === "k8s") {
+        form.name.value = "k8s-python-pi";
+        form.image.value = "python:3.11-slim";
+        form.workload_class.value = "service";
+        form.command.value = "python -c \"print('HELLO_FROM_K8S'); import time; time.sleep(20); print('K8S_DONE')\"";
+        form.ntasks.value = 1;
+      } else {
+        form.name.value = "slurm-batch-hello";
+        form.image.value = "ubuntu:22.04";
+        form.workload_class.value = "batch";
+        form.command.value = "echo HELLO_FROM_SLURM; sleep 20; echo SLURM_DONE";
+        form.ntasks.value = 1;
+      }
+    }
+    document.getElementById("submit-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const btn = document.getElementById("submit-btn");
+      btn.disabled = true;
+      btn.textContent = "Submitting…";
+      const body = {
+        name: form.name.value,
+        command: form.command.value,
+        image: form.image.value,
+        workload_class: form.workload_class.value,
+        resources: {
+          cpu: Number(form.cpu.value),
+          memory_mb: Number(form.memory_mb.value),
+          ntasks: Number(form.ntasks.value),
+        }
+      };
+      try {
+        const res = await fetch("/api/v1/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          toast(await readError(res));
+          return;
+        }
+        const job = await res.json();
+        highlightId = job.id;
+        lastJobsJson = "";
+        showLastSubmit(job);
+        toast(`Submitted ${job.name} → ${job.scheduler || "scheduler"} (${job.status})`);
+        await refreshAll();
+        await showLogs(job.id);
+      } catch (err) {
+        toast(String(err.message || err));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Submit";
+      }
+    });
+    document.getElementById("jobs").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button || !button.dataset.id) return;
+      if (button.dataset.act === "logs") showLogs(button.dataset.id);
+      if (button.dataset.act === "cancel" && !button.disabled) cancelJob(button.dataset.id);
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeLogs();
+    });
+    async function refreshAll() {
+      try { await refreshClusters(); } catch (err) {
+        document.getElementById("k8s-card").innerHTML = `<div class="meta">${err.message}</div>`;
+      }
+      try { await refreshJobs(); } catch (_err) { /* keep last table */ }
+    }
+    refreshAll();
+    setInterval(refreshAll, 4000);
+  </script>
+</body>
+</html>

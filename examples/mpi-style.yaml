@@ -1,0 +1,7 @@
+name: mpi-style
+command: "echo TASKS=$SLURM_NTASKS HOST=$(hostname); sleep 8"
+workload_class: batch
+resources:
+  cpu: 1
+  memory_mb: 128
+  ntasks: 2

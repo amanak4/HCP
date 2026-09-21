@@ -1,0 +1,11 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: hcp-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - hcp-mongo-data:/data/db
+
+volumes:
+  hcp-mongo-data:

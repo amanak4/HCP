@@ -1,0 +1,6 @@
+name: failing-job
+command: "echo ABOUT_TO_FAIL; exit 7"
+workload_class: batch
+resources:
+  cpu: 1
+  memory_mb: 64

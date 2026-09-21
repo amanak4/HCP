@@ -1,0 +1,7 @@
+name: k8s-python-pi
+image: python:3.11-slim
+command: "python -c \"print('HELLO_FROM_K8S'); print(sum(range(10000))); import time; time.sleep(12); print('K8S_DONE')\""
+workload_class: service
+resources:
+  cpu: 0.2
+  memory_mb: 128
