@@ -9,6 +9,13 @@ class PlacementError extends Error {
   }
 }
 
+/** Hard admission: cluster must be healthy and have idle CPU/memory for the request. */
+function canFit(spec, inv) {
+  if (!inv || !inv.healthy) return false;
+  return inv.cpu_idle >= spec.resources.cpu
+    && inv.memory_mb_idle >= spec.resources.memory_mb;
+}
+
 function place(spec, inventories) {
   const healthy = {};
   for (const inv of inventories) {
@@ -18,26 +25,55 @@ function place(spec, inventories) {
     throw new PlacementError("no healthy compute cluster is available");
   }
 
+  const fitting = {};
+  for (const [name, inv] of Object.entries(healthy)) {
+    if (canFit(spec, inv)) fitting[name] = inv;
+  }
+
   if (spec.scheduler_hint) {
     const hinted = spec.scheduler_hint;
+    if (fitting[hinted]) {
+      return {
+        scheduler: hinted,
+        reason: `operator hint pinned the job to ${hinted}`,
+        scores: { [hinted]: 100 },
+        fallback: false,
+        queue: false,
+      };
+    }
+    if (healthy[hinted] && !fitting[hinted]) {
+      const other = otherScheduler(hinted);
+      if (fitting[other]) {
+        return {
+          scheduler: other,
+          reason: `hint ${hinted} has no free capacity; placing on ${other}`,
+          scores: Object.fromEntries(Object.keys(fitting).map((name) => [name, 0])),
+          fallback: true,
+          queue: false,
+        };
+      }
+      return queueDecision(healthy, `hint ${hinted} and peer have no free capacity; queued until a job finishes`);
+    }
     if (!healthy[hinted]) {
       const other = otherScheduler(hinted);
-      if (healthy[other]) {
+      if (fitting[other]) {
         return {
           scheduler: other,
           reason: `hint ${hinted} is unhealthy; failing over to ${other}`,
-          scores: Object.fromEntries(Object.keys(healthy).map((name) => [name, 0])),
+          scores: Object.fromEntries(Object.keys(fitting).map((name) => [name, 0])),
           fallback: true,
+          queue: false,
         };
+      }
+      if (healthy[other]) {
+        return queueDecision(healthy, `hint ${hinted} unhealthy and ${other} has no free capacity; queued`);
       }
       throw new PlacementError(`hinted scheduler ${hinted} is unhealthy`);
     }
-    return {
-      scheduler: hinted,
-      reason: `operator hint pinned the job to ${hinted}`,
-      scores: { [hinted]: 100 },
-      fallback: false,
-    };
+  }
+
+  if (!Object.keys(fitting).length) {
+    return queueDecision(healthy, "all healthy clusters are at capacity; queued until resources free");
   }
 
   const scores = {
@@ -63,7 +99,7 @@ function place(spec, inventories) {
     scores[SchedulerName.KUBERNETES] += 10;
   }
 
-  for (const [scheduler, inv] of Object.entries(healthy)) {
+  for (const [scheduler, inv] of Object.entries(fitting)) {
     if (inv.cpu_idle >= spec.resources.cpu) scores[scheduler] += 15;
     if (inv.memory_mb_idle >= spec.resources.memory_mb) scores[scheduler] += 10;
     const pressure = inv.running_jobs + inv.pending_jobs;
@@ -72,14 +108,25 @@ function place(spec, inventories) {
 
   const eligible = {};
   for (const [name, score] of Object.entries(scores)) {
-    if (healthy[name]) eligible[name] = score;
+    if (fitting[name]) eligible[name] = score;
   }
   const winner = Object.entries(eligible).sort((a, b) => b[1] - a[1])[0][0];
   return {
     scheduler: winner,
-    reason: reasonText(spec, winner, healthy[winner], eligible),
+    reason: reasonText(spec, winner, fitting[winner], eligible),
     scores: eligible,
     fallback: false,
+    queue: false,
+  };
+}
+
+function queueDecision(healthy, reason) {
+  return {
+    scheduler: null,
+    reason,
+    scores: Object.fromEntries(Object.keys(healthy).map((name) => [name, 0])),
+    fallback: false,
+    queue: true,
   };
 }
 
@@ -119,5 +166,6 @@ function reasonText(spec, winner, inv, scores) {
 module.exports = {
   PlacementError,
   place,
+  canFit,
   fallbackScheduler,
 };

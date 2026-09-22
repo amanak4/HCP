@@ -45,18 +45,19 @@ The submit schema has no required scheduler field. Placement writes `scheduler` 
 
 ### What is your resource management approach?
 
-Soft placement, hard execution. The control plane asks each adapter for idle CPU/memory and queue depth, then biases the score. It does **not** try to be a second scheduler. Kubernetes and Slurm already queue, binpack, and preempt. If I rejected jobs the moment idle CPU was low, I would hide that and create a worse user experience. Production would add **quotas** (per team) on the control plane, and leave **fit** to the backend schedulers.
+Hard fit at submit, event-driven queue after that. The control plane asks each adapter for idle CPU/memory, scores clusters that **can fit**, and dispatches immediately. If both are healthy but full, the job is **`queued`** (HTTP 202) — not a 502. Capacity is re-checked only when a cluster event says a job finished/failed/cancelled, then the queue drains. Production would still add **quotas** (per team) on top.
 
 ### Who is the source of truth?
 
-The clusters. MongoDB is an index. After a crash, reconcile calls `status()` on each non-terminal job. I never treat the API process as the execution engine.
+The clusters. MongoDB is an index. Status is event-driven: Kubernetes Watch on Jobs, Slurm job-script callbacks to `/api/v1/internal/events`. After a crash, a one-shot bootstrap refreshes active jobs, then watches/callbacks take over. I never treat the API process as the execution engine.
 
 ### How do you handle failure?
 
 - Cluster unhealthy → ineligible for placement.
+- Both busy → queue (`queued`), drain on events.
 - Hinted cluster down → failover.
 - `submit` throws → one retry on the other adapter.
-- Both down → 503/502, job marked failed.
+- Both submit failures → 502, job marked failed. No healthy cluster → 503.
 - Cancel fails on the backend → surface 502, do not silently claim success.
 - Status `unknown` during a blip → do not overwrite `running`/`pending`.
 - Job process exits non-zero → unified `failed`.
@@ -113,9 +114,9 @@ Say these in this order. It sounds senior.
 |---|---|---|
 | Separate clusters + gateway | Matches the assignment and real labs | Extra hop, eventual consistency |
 | Score-based placement | Explainable in the UI | Heuristic, not optimal |
-| Allow queueing when busy | Backends already queue | Control plane can over-accept |
+| Control-plane queue when busy | No 502/“no space”; drain on job events | Gateway holds work briefly |
 | One-shot failover | High availability for a demo | A job might run in a surprising place |
-| MongoDB + reconcile | Survives API restart; nested job spec in Compass | Demo has no auth on Mongo |
+| Event-driven status (watch/callbacks) | No standing poll loop | Needs reachable callback host for Slurm |
 | Kind + Compose | Laptop, individual nodes | Not hardware-accurate |
 
 ---
@@ -165,8 +166,8 @@ If you did not get to ask during the week, say what you assumed:
 
 ## Phrases that score well
 
-- “The control plane is a gateway, not a third scheduler.”
+- “Hard fit at submit; event-driven drain when a job finishes.”
 - “Clusters are the source of truth; MongoDB is an index.”
 - “Users submit intent; adapters submit mechanism.”
-- “I would rather queue on a real scheduler than reject in my API.”
+- “Busy clusters queue in the API — we do not return no-space errors.”
 - “The production gap is identity, quotas, and a shared data plane — not more YAML.”

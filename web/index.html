@@ -145,7 +145,7 @@
     .status-running { color: var(--accent); }
     .status-succeeded { color: var(--good); }
     .status-failed, .status-cancelled { color: var(--bad); }
-    .status-pending, .status-accepted { color: var(--warn); }
+    .status-pending, .status-accepted, .status-queued { color: var(--warn); }
     .status-pill {
       display: inline-block;
       font-weight: 700;
@@ -262,7 +262,7 @@
           </div>
           <div>
             <label>Command</label>
-            <textarea name="command" required>echo hello; sleep 20; echo done</textarea>
+            <textarea name="command" required>i=1; while [ "$i" -le 20 ]; do echo "$i"; sleep 1; i=$((i+1)); done; echo done</textarea>
           </div>
           <div>
             <label>Image (used on Kubernetes)</label>
@@ -304,7 +304,7 @@
     <header>
       <div>
         <h1>Job logs</h1>
-        <div class="sub" id="log-title">Select a job</div>
+        <div class="sub" id="log-title">Select a job — live stream (SSE)</div>
       </div>
       <button class="secondary" type="button" onclick="closeLogs()">Close</button>
     </header>
@@ -314,7 +314,7 @@
 
   <script>
     const api = "";
-    const live = { accepted: true, pending: true, running: true };
+    const live = { accepted: true, queued: true, pending: true, running: true };
     let lastJobsJson = "";
     let highlightId = "";
     async function get(path) {
@@ -361,7 +361,8 @@
     function showLastSubmit(job) {
       const banner = document.getElementById("last-submit");
       banner.classList.add("show");
-      document.getElementById("last-submit-title").textContent = `${job.name} → ${job.scheduler || "placing…"}`;
+      const target = job.scheduler || (job.status === "queued" ? "control-plane queue" : "placing…");
+      document.getElementById("last-submit-title").textContent = `${job.name} → ${target}`;
       document.getElementById("last-submit-sub").textContent = `${job.status} · ${job.id}`;
     }
     async function refreshJobs() {
@@ -395,21 +396,57 @@
       }
       return jobs;
     }
-    async function showLogs(id) {
-      document.getElementById("drawer-back").classList.add("open");
-      document.getElementById("drawer").classList.add("open");
-      document.getElementById("log-title").textContent = `Loading ${id}…`;
-      document.getElementById("logs").textContent = "Fetching logs…";
-      try {
-        const data = await get(`/api/v1/jobs/${id}/logs`);
-        document.getElementById("log-title").textContent = `Job ${id} on ${data.scheduler || "unknown"}`;
-        document.getElementById("logs").textContent = data.logs || "(no logs yet — the job may still be starting)";
-      } catch (err) {
-        document.getElementById("log-title").textContent = `Job ${id}`;
-        document.getElementById("logs").textContent = String(err);
+    let logSource = null;
+    function stopLogStream() {
+      if (logSource) {
+        try { logSource.close(); } catch (_err) { /* ignore */ }
+        logSource = null;
       }
     }
+    function showLogs(id) {
+      stopLogStream();
+      document.getElementById("drawer-back").classList.add("open");
+      document.getElementById("drawer").classList.add("open");
+      document.getElementById("log-title").textContent = `Live logs · ${id}`;
+      const pre = document.getElementById("logs");
+      pre.textContent = "";
+      const append = (text) => {
+        pre.textContent += text;
+        pre.scrollTop = pre.scrollHeight;
+      };
+      append("Connecting to log stream…\n");
+      const es = new EventSource(`/api/v1/jobs/${encodeURIComponent(id)}/logs/stream`);
+      logSource = es;
+      es.onmessage = (event) => {
+        let payload;
+        try { payload = JSON.parse(event.data); } catch {
+          append(event.data + "\n");
+          return;
+        }
+        if (payload.type === "meta") {
+          document.getElementById("log-title").textContent =
+            `Live logs · ${payload.id} on ${payload.scheduler || "—"} (${payload.status || ""})`;
+          pre.textContent = "";
+          return;
+        }
+        if (payload.type === "line" && payload.text != null) {
+          append(payload.text);
+          return;
+        }
+        if (payload.type === "end") {
+          append(`\n— stream ended (${payload.reason || "done"}) —\n`);
+          stopLogStream();
+        }
+      };
+      es.onerror = () => {
+        if (logSource === es) {
+          append("\n(log stream disconnected)\n");
+          stopLogStream();
+        }
+      };
+    }
     function closeLogs() {
+      stopLogStream();
       document.getElementById("drawer-back").classList.remove("open");
       document.getElementById("drawer").classList.remove("open");
     }
@@ -431,13 +468,13 @@
         form.name.value = "k8s-python-pi";
         form.image.value = "python:3.11-slim";
         form.workload_class.value = "service";
-        form.command.value = "python -c \"print('HELLO_FROM_K8S'); import time; time.sleep(20); print('K8S_DONE')\"";
+        form.command.value = "python -c \"import time\\nfor i in range(1,21):\\n print(i, flush=True)\\n time.sleep(1)\\nprint('K8S_DONE', flush=True)\"";
         form.ntasks.value = 1;
       } else {
         form.name.value = "slurm-batch-hello";
         form.image.value = "ubuntu:22.04";
         form.workload_class.value = "batch";
-        form.command.value = "echo HELLO_FROM_SLURM; sleep 20; echo SLURM_DONE";
+        form.command.value = "i=1; while [ \"$i\" -le 20 ]; do echo \"$i\"; sleep 1; i=$((i+1)); done; echo SLURM_DONE";
         form.ntasks.value = 1;
       }
     }
@@ -472,7 +509,7 @@
         highlightId = job.id;
         lastJobsJson = "";
         showLastSubmit(job);
-        toast(`Submitted ${job.name} → ${job.scheduler || "scheduler"} (${job.status})`);
+        toast(`Submitted ${job.name} → ${job.scheduler || "queue"} (${job.status})`);
         await refreshAll();
         await showLogs(job.id);
       } catch (err) {

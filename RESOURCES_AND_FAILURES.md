@@ -8,21 +8,19 @@ Say this out loud: **the control plane is a gateway, not a third scheduler.** Ku
 
 Two layers. Do not mix them up in the interview.
 
-### Layer A — Placement (soft, in our API)
+### Layer A — Placement + control-plane queue
 
-Before submit, each adapter reports **inventory**:
+Before submit, each adapter reports **inventory** (on demand at submit / queue drain / cluster UI — not on a timer):
 
 - healthy / not
 - idle CPU, idle memory
 - running + pending counts (queue pressure)
 
-`placement.js` **scores** healthy clusters. Capacity is a bonus, not a hard gate:
+`placement.js` **scores** healthy clusters that **fit** the request (`canFit`: idle CPU/memory ≥ request). Capacity is a hard admission gate for *immediate* dispatch:
 
-- idle CPU ≥ request → **+15**
-- idle memory ≥ request → **+10**
-- `(running + pending) * 2`, capped at **−20**
-
-Busy clusters can still win. If we rejected whenever idle CPU was low, we would hide the real scheduler’s queue and give a worse UX.
+- idle CPU ≥ request and idle memory ≥ request → eligible to place (+ score bonuses)
+- healthy but **no** cluster fits → job stays **`queued`** in Mongo (HTTP **202**), not rejected
+- when a cluster emits a job lifecycle event (finished / failed / cancelled / updated), the control plane re-checks inventory and drains the queue
 
 Other score inputs (workload shape, not live capacity):
 
@@ -34,9 +32,9 @@ Other score inputs (workload shape, not live capacity):
 | `ntasks > 1` | Slurm +30 |
 | GPU field > 0 | Kubernetes +10 (laptop has no GPUs; preference only) |
 
-Unhealthy cluster = **ineligible**, even with a higher theoretical score.
+Unhealthy cluster = **ineligible**, even with a higher theoretical score. No healthy cluster = **503**.
 
-Phrase: *“Soft placement, hard execution.”*
+Phrase: *“Hard fit at the gateway, event-driven drain — not a poll loop.”*
 
 ### Layer B — Execution (hard, on the cluster)
 
@@ -54,8 +52,8 @@ Slurm UI idle CPU comes from `sinfo %C` (allocated/idle/other/total). Idle memor
 
 - No team quotas, QOS, or PriorityClass.
 - No GPU device plugin / GRES (field exists, hardware does not).
-- No “reject at API if cluster is 80% full.” Backends already queue.
-- Production would add **admission** (quotas, max walltime, allowed images) on the gateway and still leave **fit** to Kubernetes/Slurm.
+- Busy clusters → **control-plane queue** (`queued`), not HTTP 502 “no space”.
+- Production would add **admission** (quotas, max walltime, allowed images) on the gateway and still leave **fit** to Kubernetes/Slurm for work already submitted.
 
 ---
 
@@ -68,33 +66,39 @@ Walk these in order. They map 1:1 to code.
 | Failure | What we do | HTTP |
 |---|---|---|
 | No healthy cluster | Do not submit. Job `failed`. | 503 |
+| Both healthy but no free capacity | Job `queued`; drain on cluster events | 202 |
 | Hinted cluster down, peer healthy | Fail over, `fallback=true` | 201 |
 | `adapter.submit` throws | Retry **once** on the other healthy cluster | 201 if peer works |
 | Both submits fail | Job `failed` | 502 |
 | Bad spec (empty command, bad name) | No cluster call | 422 |
 
-`dispatch()` in `server.js` is the one-shot failover.
+`dispatch()` in `server.js` is the one-shot failover. `events.drainQueue()` runs when a job reaches a terminal state.
 
 ### Runtime path
 
-Reconcile every ~3s calls `adapter.status(native_id)` for non-terminal jobs.
+Status is **event-driven** (no reconcile poll):
+
+- **Kubernetes:** Watch API on `batch/v1` Jobs labeled `hcp.managed=true`
+- **Slurm:** job script callbacks via bash `/dev/tcp` → `POST /api/v1/internal/events`
+- **Startup:** one-shot `bootstrapStatuses()` then drain queued work
 
 | Failure | What we do |
 |---|---|
-| Command exit ≠ 0 | Cluster says failed → UI `failed` |
-| Image pull error (`ErrImagePull`) | Job `failed` on Kubernetes after backoff |
+| Command exit ≠ 0 | Cluster event → UI `failed` |
+| Image pull error (`ErrImagePull`) | Job `failed` on Kubernetes after backoff (watch) |
 | Status blip / `UNKNOWN` | **Do not** overwrite `pending`/`running` |
-| Control plane crash | Jobs keep running on the cluster. On restart, Mongo + `status()` rebuild the table |
+| Control plane crash | Jobs keep running on the cluster. On restart, Mongo + one-shot status + watches rebuild the table |
 | Node `c1` down | Slurm can still place on `c2` (partition has both) |
 
-Phrase: *“Clusters are the source of truth; MongoDB is an index.”*
+Phrase: *“Clusters are the source of truth; MongoDB is an index; events keep them aligned.”*
 
 ### Cancel path
 
 | Case | What we do |
 |---|---|
 | Job already succeeded/failed/cancelled | **409**, button disabled. Do not lie. |
-| Job pending/running | `kubectl delete job` or `scancel`, then mark `cancelled` |
+| Job queued | Mark `cancelled` in index (never reached a cluster) |
+| Job pending/running | `kubectl delete job` or `scancel`, then mark `cancelled`, then drain queue |
 | Backend cancel throws | **502**, message kept. Do not mark cancelled if the cluster said no |
 
 ### Demo-shaped gaps (say them; it scores well)
@@ -108,16 +112,16 @@ Phrase: *“Clusters are the source of truth; MongoDB is an index.”*
 
 ## 3. 60-second spoken version
 
-> Resource management is two layers. The control plane scores healthy clusters using workload shape and idle CPU/memory. That score is a hint, not admission. Kubernetes enforces requests/limits on the pod; Slurm enforces CPU/memory via `sbatch` and `cons_tres` on `c1`/`c2`. If a cluster is busy, we still submit and let it queue.
+> Resource management is two layers. The control plane admits only to healthy clusters with enough idle CPU/memory. If both are busy, the job is queued in the API and drained when a cluster event says a job finished. Kubernetes enforces requests/limits on the pod; Slurm enforces CPU/memory via `sbatch` and `cons_tres` on `c1`/`c2`.
 >
-> Failures: unhealthy clusters are skipped. Submit error fails over once. Both down is 502. We never clobber running with unknown. Cancel of a finished job is 409. After an API crash, the job is still on the cluster and reconcile catches up.
+> Failures: unhealthy clusters are skipped. Busy → queue (202), not reject. Submit error fails over once. Both submit failures are 502. Status comes from watches/callbacks, not a poll loop. Cancel of a finished job is 409.
 
 ---
 
 ## 4. If they push back
 
-**Why not reject when idle CPU < request?**  
-Because idle is a snapshot. Slurm/Kubernetes will start the job when a slot frees. Rejecting in the gateway duplicates the scheduler badly.
+**Why queue in the API when idle CPU < request?**  
+So the user gets an accepted job immediately instead of a 502/“no space” error. Capacity is re-checked only when a job event frees resources — not by polling inventory on a timer.
 
 **Why fail over instead of returning an error?**  
 Demo availability. I would make failover a policy flag in production (some users must stay on Slurm for licensing).

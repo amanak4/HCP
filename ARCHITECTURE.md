@@ -16,10 +16,10 @@ flowchart LR
   subgraph ControlPlane[Control plane]
     API[REST API<br/>submit / list / status / logs / cancel]
     Place[Placement policy]
-    Rec[Reconcile loop]
-    DB[(MongoDB index)]
-    KAd[K8s adapter]
-    SAd[Slurm adapter]
+  Rec[Event bus + queue drain]
+  DB[(MongoDB index)]
+  KAd[K8s adapter + Watch]
+  SAd[Slurm adapter + callbacks]
   end
 
   subgraph K8S[Kubernetes cluster - Kind]
@@ -72,7 +72,10 @@ sequenceDiagram
   API->>P: place(spec, inventories)
   P-->>API: scheduler + reason + scores
   API->>A: submit(job)
-  alt submit succeeds
+  alt both healthy but no capacity
+    API->>DB: status=queued
+    API-->>User: 202 JobView (queued)
+  else submit succeeds
     A->>C: create K8s Job or sbatch
     C-->>A: native id
     API->>DB: pending + native_id + reason
@@ -140,6 +143,9 @@ Both backends are mapped into one enum. That is the abstraction.
 stateDiagram-v2
   [*] --> accepted
   accepted --> pending: adapter.submit ok
+  accepted --> queued: healthy but no free capacity
+  queued --> pending: event frees capacity + dispatch
+  queued --> cancelled: user cancel
   accepted --> failed: no cluster / submit error
   pending --> running: scheduler started work
   running --> succeeded
@@ -169,8 +175,8 @@ flowchart LR
   end
 
   subgraph Runtime
-    R1[Reconcile poll] --> R2[Map native state]
-    R2 --> R3[Do not clobber terminal states with unknown]
+    R1[K8s Watch / Slurm callbacks] --> R2[Map native state]
+    R2 --> R3[On terminal: re-check capacity + drain queue]
   end
 
   subgraph ControlPlaneCrash

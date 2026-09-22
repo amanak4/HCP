@@ -4,9 +4,9 @@ This note starts **after** placement has already chosen a cluster. The control p
 
 The control plane does **not** start processes itself. It only:
 
-1. Creates the native object (`batch/v1 Job` or `sbatch`)
-2. Stores `native_id`
-3. Polls `status()` / `logs()` / `cancel()`
+1. Creates the native object (`batch/v1 Job` or `sbatch`) — or **queues** the job if both clusters are at capacity
+2. Stores `native_id` (once dispatched)
+3. Receives status via **events** (K8s Watch / Slurm job callbacks), plus `logs()` / `cancel()`
 
 ---
 
@@ -14,13 +14,15 @@ The control plane does **not** start processes itself. It only:
 
 ```text
 JobSpec
+  → place(): fit? → dispatch  OR  status=queued (202)
   → KubernetesAdapter.submit  OR  SlurmAdapter.submit
       → native_id  (hcp-<id>  or  14)
   → MongoDB: pending + scheduler + native_id
-  → every ~3s reconcile asks the cluster: what is this job doing?
+  → events: K8s Watch / Slurm /dev/tcp callback → update status
+  → on terminal event: re-check capacity + drain control-plane queue
 ```
 
-Code: `control-plane/src/server.js` (`dispatch`), `adapters/kubernetes.js`, `adapters/slurm.js`.
+Code: `control-plane/src/server.js` (`dispatch`), `events.js`, `adapters/kubernetes.js`, `adapters/slurm.js`.
 
 ---
 

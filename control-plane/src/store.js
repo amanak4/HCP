@@ -58,6 +58,15 @@ class JobStore {
     const docs = await this.col.find({ status: { $nin: TERMINAL } }).toArray();
     return docs.map(fromDoc);
   }
+
+  /** Control-plane queue: oldest first so drain is FIFO with backfill skips. */
+  async queued() {
+    const docs = await this.col
+      .find({ status: JobStatus.QUEUED })
+      .sort({ created_at: 1 })
+      .toArray();
+    return docs.map(fromDoc);
+  }
 }
 
 let store;

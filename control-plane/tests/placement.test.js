@@ -89,3 +89,33 @@ test("parallel tasks prefer slurm", () => {
   ]);
   assert.equal(decision.scheduler, SchedulerName.SLURM);
 });
+
+test("both clusters busy returns queue decision instead of reject", () => {
+  const spec = parseJobSpec({
+    name: "wait",
+    command: "sleep 1",
+    resources: { cpu: 4, memory_mb: 1024 },
+  });
+  const decision = place(spec, [
+    inv(SchedulerName.KUBERNETES, true, 0.5, 128, 3),
+    inv(SchedulerName.SLURM, true, 1, 64, 2),
+  ]);
+  assert.equal(decision.queue, true);
+  assert.equal(decision.scheduler, null);
+  assert.match(decision.reason, /queued/i);
+});
+
+test("places on the cluster that still has capacity", () => {
+  const spec = parseJobSpec({
+    name: "fit",
+    command: "sleep 1",
+    workload_class: WorkloadClass.BATCH,
+    resources: { cpu: 2, memory_mb: 256 },
+  });
+  const decision = place(spec, [
+    inv(SchedulerName.KUBERNETES, true, 0.1, 64, 5),
+    inv(SchedulerName.SLURM, true, 4, 2048, 0),
+  ]);
+  assert.equal(decision.queue, false);
+  assert.equal(decision.scheduler, SchedulerName.SLURM);
+});

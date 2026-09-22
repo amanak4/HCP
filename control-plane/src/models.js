@@ -12,6 +12,7 @@ const SchedulerName = {
 
 const JobStatus = {
   ACCEPTED: "accepted",
+  QUEUED: "queued",
   PENDING: "pending",
   RUNNING: "running",
   SUCCEEDED: "succeeded",

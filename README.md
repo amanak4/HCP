@@ -31,7 +31,7 @@ The interviewer is not asking you to become a Kubernetes or Slurm expert. They a
 2. **Define one job spec** that is not K8s YAML and not a Slurm batch script: name, command, image, CPU/memory, workload class.
 3. **Write two adapters** behind the same interface: `submit`, `status`, `cancel`, `logs`, `health`.
 4. **Write a placement policy** that scores both clusters (batch vs service, container image, parallel tasks, live capacity, health). Optional `scheduler_hint` is an operator escape hatch, not a user field.
-5. **Persist jobs in MongoDB** (nested documents, including `resources`) and **reconcile** against the clusters so the control plane is not the source of truth.
+5. **Persist jobs in MongoDB** (nested documents, including `resources`) and keep status **event-driven** (K8s watch + Slurm callbacks) so the control plane is not the source of truth.
 6. **Expose one API / CLI / UI**. Demo two jobs that look identical to the user and land on different schedulers.
 7. **Prepare the interview**: architecture diagram, why you routed the way you did, failure cases, what is demo-grade vs production-grade.
 
@@ -139,17 +139,17 @@ flowchart TB
   place --> slurmA
   k8sA --> kind
   slurmA --> slurm
-  api -.->|reconcile every 3s| k8sA
-  api -.->|reconcile every 3s| slurmA
+  api -.->|k8s watch + slurm callbacks| k8sA
+  api -.->|k8s watch + slurm callbacks| slurmA
 ```
 
 ---
 
 ## Design in one page
 
-**Resource management.** Each adapter reports inventory (healthy, idle CPU, idle memory, running/pending). Placement uses that as a score, not a hard admission wall. Busy clusters still accept work and queue it. That matches how HPC and Kubernetes already behave.
+**Resource management.** Each adapter reports inventory (healthy, idle CPU, idle memory, running/pending). Placement scores healthy clusters that **can fit** the request. If both are healthy but at capacity, the job is **queued** in the control plane (`202` + `status=queued`) instead of rejected. When a cluster reports a job finished/failed/cancelled event, capacity is re-checked and the queue is drained — there is no standing idle-CPU poll loop.
 
-**Failure handling.** If the preferred scheduler is down or `submit` throws, the control plane fails over once to the other scheduler. Cancel is best-effort on the backend, then marked cancelled in the index. The reconcile loop is the recovery path after a control-plane restart: clusters keep running jobs; MongoDB plus live `status()` rebuilds the view.
+**Failure handling.** If the preferred scheduler is down or `submit` throws, the control plane fails over once to the other scheduler. Cancel is best-effort on the backend, then marked cancelled in the index. Job status is **event-driven**: Kubernetes Watch on Jobs, Slurm job-script callbacks to `POST /api/v1/internal/events`. After a control-plane restart, a one-shot bootstrap refreshes active jobs; steady state does not poll.
 
 **Source of truth.** Kubernetes Jobs and Slurm job IDs are authoritative. MongoDB is a cache/index so the UI can list work across both systems. That is the most important production-shaped decision in this demo.
 

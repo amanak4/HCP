@@ -1,5 +1,5 @@
 const Docker = require("dockerode");
-const { SLURM_CONTAINER } = require("../config");
+const { SLURM_CONTAINER, CALLBACK_HOST, CALLBACK_PORT, EVENT_TOKEN } = require("../config");
 const { JobStatus, SchedulerName, inventory } = require("../models");
 
 const STATE_MAP = {
@@ -214,10 +214,90 @@ class SlurmAdapter {
       return `(log error) ${err.message || err}`;
     }
   }
+
+  /**
+   * Follow Slurm stdout/stderr files (tail -F). Stops when signal aborts or
+   * the Slurm job leaves active states (then a short grace flush).
+   */
+  async streamLogs(job, onChunk, { signal } = {}) {
+    const client = await this._ensureClient();
+    const container = client.getContainer(this.containerName);
+    const jobDir = `/data/jobs/${job.id}`;
+    const nativeId = job.native_id || "";
+    const cmd = [
+      `mkdir -p ${jobDir}`,
+      `touch ${jobDir}/slurm.out ${jobDir}/slurm.err`,
+      `tail -n +1 -F ${jobDir}/slurm.out ${jobDir}/slurm.err &`,
+      "TAIL_PID=$!",
+      "trap 'kill $TAIL_PID 2>/dev/null || true' EXIT",
+      nativeId
+        ? [
+          `while true; do`,
+          `  state=$(scontrol show job ${nativeId} 2>/dev/null | tr ' ' '\\n' | awk -F= '/^JobState=/{print $2; exit}')`,
+          `  case "$state" in`,
+          `    PENDING|CONFIGURING|RUNNING|COMPLETING|SUSPENDED|"") sleep 1 ;;`,
+          `    *) sleep 1; break ;;`,
+          `  esac`,
+          `  kill -0 $TAIL_PID 2>/dev/null || break`,
+          `done`,
+        ].join(" ")
+        : "while kill -0 $TAIL_PID 2>/dev/null; do sleep 1; done",
+      "kill $TAIL_PID 2>/dev/null || true",
+      "wait $TAIL_PID 2>/dev/null || true",
+    ].join("; ");
+
+    let inspect;
+    try {
+      inspect = await container.inspect();
+    } catch (err) {
+      if (err.statusCode === 404) throw new Error(`slurm controller ${this.containerName} is not running`);
+      throw err;
+    }
+    if (!inspect) throw new Error(`slurm controller ${this.containerName} is not running`);
+
+    const exec = await container.exec({
+      Cmd: ["bash", "-lc", cmd],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
+    const stream = await exec.start({ hijack: true, stdin: false });
+
+    const abort = () => {
+      try { stream.destroy(); } catch (_err) { /* ignore */ }
+    };
+    if (signal) {
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+    }
+
+    await new Promise((resolve, reject) => {
+      const writeChunk = {
+        write(chunk) {
+          try { onChunk(Buffer.from(chunk).toString("utf8")); } catch (_err) { /* ignore */ }
+        },
+      };
+      client.modem.demuxStream(stream, writeChunk, writeChunk);
+      stream.on("end", resolve);
+      stream.on("close", resolve);
+      stream.on("error", (err) => {
+        if (signal?.aborted) resolve();
+        else reject(err);
+      });
+    });
+  }
+
+  /** Slurm has no Watch API; job scripts push lifecycle events via /dev/tcp callbacks. */
+  startWatch(_onEvent) {
+    return () => {};
+  }
 }
 
 function sbatchScript(job) {
   const res = job.spec.resources;
+  // Event callback from the compute node — no polling. Uses bash /dev/tcp (no curl required).
   return `#!/bin/bash
 #SBATCH --job-name=${job.spec.name}
 #SBATCH --ntasks=${res.ntasks}
@@ -225,10 +305,35 @@ function sbatchScript(job) {
 #SBATCH --mem=${res.memory_mb}M
 #SBATCH --output=/data/jobs/${job.id}/slurm.out
 #SBATCH --error=/data/jobs/${job.id}/slurm.err
-set -euo pipefail
+set -uo pipefail
+HCP_JOB_ID='${job.id}'
+HCP_EVENT_TOKEN='${EVENT_TOKEN}'
+HCP_CALLBACK_HOST='${CALLBACK_HOST}'
+HCP_CALLBACK_PORT='${CALLBACK_PORT}'
+hcp_notify() {
+  local st="$1"
+  local msg="\${2:-}"
+  local body
+  body=$(printf '{"job_id":"%s","status":"%s","scheduler":"slurm","native_id":"%s","message":"%s","token":"%s"}' \\
+    "$HCP_JOB_ID" "$st" "\${SLURM_JOB_ID:-}" "$msg" "$HCP_EVENT_TOKEN")
+  {
+    printf 'POST /api/v1/internal/events HTTP/1.0\\r\\n'
+    printf 'Host: %s\\r\\n' "$HCP_CALLBACK_HOST"
+    printf 'Content-Type: application/json\\r\\n'
+    printf 'Content-Length: %d\\r\\n' "\${#body}"
+    printf '\\r\\n'
+    printf '%s' "$body"
+  } >/dev/tcp/"$HCP_CALLBACK_HOST"/"$HCP_CALLBACK_PORT" 2>/dev/null || true
+}
+trap 'hcp_notify cancelled interrupted' TERM INT
+trap 'hcp_notify failed command_error; exit 1' ERR
+hcp_notify running started
+set -e
 echo "hcp job ${job.id} starting on $(hostname) at $(date -Is)"
 ${job.spec.command}
 echo "hcp job ${job.id} finished at $(date -Is)"
+trap - ERR
+hcp_notify succeeded completed
 `;
 }
 
