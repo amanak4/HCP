@@ -16,8 +16,9 @@ const KUBECONFIG = process.env.KUBECONFIG || "";
 
 const ADAPTER_TIMEOUT_SECONDS = Number(process.env.HCP_ADAPTER_TIMEOUT || 20);
 
-// Reachable from Slurm compute containers (see docker-compose host-gateway).
-const CALLBACK_HOST = process.env.HCP_CALLBACK_HOST || "host.docker.internal";
+// Compute nodes sit on 172.28.0.0/24. Callbacks use the Docker bridge
+// gateway so they reach the API on the host.
+const CALLBACK_HOST = process.env.HCP_CALLBACK_HOST || "172.28.0.1";
 const CALLBACK_PORT = Number(process.env.HCP_CALLBACK_PORT || API_PORT);
 const EVENT_TOKEN = process.env.HCP_EVENT_TOKEN || "hcp-demo-event-token";
 

@@ -1,7 +1,7 @@
 const k8s = require("@kubernetes/client-node");
 const { PassThrough } = require("stream");
 const { K8S_CONTEXT, K8S_NAMESPACE, KUBECONFIG } = require("../config");
-const { JobStatus, SchedulerName, inventory } = require("../models");
+const { JobStatus, SchedulerName, TERMINAL_STATUSES, inventory } = require("../models");
 const logger = require("../logger");
 
 function isNotFound(err) {
@@ -13,9 +13,12 @@ function mapJobStatus(st = {}) {
   const succeeded = st.succeeded || 0;
   const failed = st.failed || 0;
   const active = st.active || 0;
+  const ready = st.ready || 0;
   if (succeeded) return { status: JobStatus.SUCCEEDED, message: "job completed" };
   if (failed) return { status: JobStatus.FAILED, message: "job failed" };
-  if (active) return { status: JobStatus.RUNNING, message: "pod running" };
+  // Job.active counts Pending + Running pods. Ready means a pod is actually up.
+  if (ready) return { status: JobStatus.RUNNING, message: "pod running" };
+  if (active) return { status: JobStatus.PENDING, message: "waiting for pod" };
   return { status: JobStatus.PENDING, message: "waiting for pod" };
 }
 
@@ -88,8 +91,13 @@ class KubernetesAdapter {
       let pending = 0;
       for (const pod of pods.body.items) {
         const phase = String(pod.status?.phase || "").toLowerCase();
-        if (phase === "running") running += 1;
-        else if (phase === "pending") pending += 1;
+        const labels = pod.metadata?.labels || {};
+        const ours = pod.metadata?.namespace === this.namespace
+          || Boolean(labels["hcp.job-id"])
+          || labels["hcp.managed"] === "true";
+        // Idle CPU/mem must include kube-system. Job counts are HCP only.
+        if (ours && phase === "running") running += 1;
+        else if (ours && phase === "pending") pending += 1;
         if (phase === "succeeded" || phase === "failed") continue;
         for (const container of pod.spec?.containers || []) {
           const requests = container.resources?.requests || {};
@@ -266,31 +274,47 @@ class KubernetesAdapter {
     try {
       const pod = await this._latestPod(job.id);
       if (!pod) return "";
-      const log = await this.core.readNamespacedPodLog(pod.metadata.name, this.namespace);
-      return typeof log.body === "string" ? log.body : String(log.body || "");
+      return await this._readPodLogs(pod);
     } catch (err) {
       return `(log error) ${err.message || err}`;
     }
   }
 
+  async _readPodLogs(pod) {
+    const name = pod.metadata.name;
+    const container = (pod.spec?.containers || [])[0]?.name || "main";
+    try {
+      const log = await this.core.readNamespacedPodLog(name, this.namespace, container);
+      return typeof log.body === "string" ? log.body : String(log.body || "");
+    } catch (err) {
+      if (isNotFound(err)) return "";
+      throw err;
+    }
+  }
+
   async _latestPod(jobId) {
-    const pods = await this.core.listNamespacedPod(
-      this.namespace,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      `hcp.job-id=${jobId}`,
-    );
-    const items = pods.body.items || [];
-    if (!items.length) return null;
-    items.sort((a, b) => String(a.metadata?.creationTimestamp || "").localeCompare(String(b.metadata?.creationTimestamp || "")));
-    return items[items.length - 1];
+    const selectors = [`hcp.job-id=${jobId}`, `job-name=hcp-${jobId}`];
+    for (const selector of selectors) {
+      const pods = await this.core.listNamespacedPod(
+        this.namespace,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        selector,
+      );
+      const items = pods.body.items || [];
+      if (!items.length) continue;
+      items.sort((a, b) => String(a.metadata?.creationTimestamp || "").localeCompare(String(b.metadata?.creationTimestamp || "")));
+      return items[items.length - 1];
+    }
+    return null;
   }
 
   /**
-   * Follow pod logs (kubectl logs -f). Calls onChunk(string) as data arrives.
-   * Resolves when the follow stream ends or signal aborts.
+   * Follow pod logs while running; snapshot when the pod already finished.
+   * Finished Jobs delete their pods (ttlSecondsAfterFinished), so we stop
+   * waiting immediately if Mongo already says the job is terminal.
    */
   async streamLogs(job, onChunk, { signal } = {}) {
     if (!this.ready) this._load();
@@ -306,6 +330,10 @@ class KubernetesAdapter {
       if (signal?.aborted) return;
       pod = await this._latestPod(job.id);
       if (pod) break;
+      if (TERMINAL_STATUSES.has(job.status)) {
+        onChunk("(no pod left — Kubernetes removes finished Job pods after a few minutes, so logs are only available while the pod still exists)\n");
+        return;
+      }
       if (!waitingNoted) {
         onChunk("(waiting for pod…)\n");
         waitingNoted = true;
@@ -315,6 +343,22 @@ class KubernetesAdapter {
         onChunk("(timed out waiting for pod)\n");
         return;
       }
+    }
+
+    const phase = String(pod.status?.phase || "").toLowerCase();
+    const follow = phase === "running" || phase === "pending";
+    if (phase && phase !== "running") {
+      onChunk(`(pod ${pod.metadata.name} is ${phase})\n`);
+    }
+
+    if (!follow) {
+      try {
+        const text = await this._readPodLogs(pod);
+        onChunk(text || "(container produced no logs)\n");
+      } catch (err) {
+        onChunk(`(log error) ${err.message || err}\n`);
+      }
+      return;
     }
 
     const container = (pod.spec?.containers || [])[0]?.name || "main";
@@ -333,7 +377,12 @@ class KubernetesAdapter {
         timestamps: false,
       });
     } catch (err) {
-      onChunk(`(log stream error) ${err.message || err}\n`);
+      try {
+        const text = await this._readPodLogs(pod);
+        onChunk(text || `(log stream error) ${err.message || err}\n`);
+      } catch (_err) {
+        onChunk(`(log stream error) ${err.message || err}\n`);
+      }
       return;
     }
 

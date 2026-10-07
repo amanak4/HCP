@@ -14,3 +14,6 @@ control-plane/data/
 .kube/
 *.log
 node_modules/
+
+# Local notes and machine scripts. Not part of the project.
+prep/

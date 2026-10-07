@@ -32,7 +32,7 @@ services:
     environment:
       SLURM_ROLE: compute
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:172.28.0.1"
     volumes:
       - munge-key:/shared/munge
       - slurm-data:/data
@@ -53,7 +53,7 @@ services:
     environment:
       SLURM_ROLE: compute
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:172.28.0.1"
     volumes:
       - munge-key:/shared/munge
       - slurm-data:/data

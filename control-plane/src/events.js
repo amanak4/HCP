@@ -1,5 +1,5 @@
 const { JobStatus, TERMINAL_STATUSES } = require("./models");
-const { place } = require("./placement");
+const { place, applyClaims } = require("./placement");
 const logger = require("./logger");
 
 /**
@@ -81,6 +81,7 @@ function createEventBus({ store, adapters, inventories, dispatch }) {
         for (const inv of live) {
           capacity[inv.scheduler] = { ...inv };
         }
+        applyClaims(Object.values(capacity), await store.active());
 
         for (const job of queued) {
           // Re-read in case cancel raced.

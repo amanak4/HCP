@@ -125,19 +125,25 @@ class SlurmAdapter {
           message: ping.output || "slurmctld not UP",
         });
       }
-      const info = await this._exec("sinfo -h -o '%C %e'");
+      const info = await this._exec("sinfo -h -o '%C'");
       let cpuIdle = 0;
-      let memIdle = 0;
       if (info.code === 0 && info.output) {
         const first = info.output.split("\n")[0];
-        const parts = first.split(/\s+/);
-        if (parts[0] && parts[0].includes("/")) {
-          const [, idle] = parts[0].split("/");
+        if (first.includes("/")) {
+          const [, idle] = first.split("/");
           cpuIdle = Number(idle);
         }
-        if (parts[1] && !["N/A", "n/a"].includes(parts[1])) {
-          const parsed = Number(parts[1]);
-          memIdle = Number.isNaN(parsed) ? 0 : Math.trunc(parsed);
+      }
+      // sinfo %e is OS free RAM (several GB in Docker). sbatch --mem must
+      // fit on one node's RealMemory (1000 MiB here). Use the largest
+      // unallocated RealMemory so canFit matches what Slurm will admit.
+      let memIdle = 0;
+      const nodes = await this._exec("scontrol -o show node");
+      if (nodes.code === 0 && nodes.output) {
+        for (const line of nodes.output.split("\n")) {
+          const real = Number((line.match(/RealMemory=(\d+)/) || [])[1] || 0);
+          const alloc = Number((line.match(/AllocMem=(\d+)/) || [])[1] || 0);
+          if (real > 0) memIdle = Math.max(memIdle, real - alloc);
         }
       }
       const queue = await this._exec("squeue -h -o '%T'");
@@ -223,28 +229,26 @@ class SlurmAdapter {
     const client = await this._ensureClient();
     const container = client.getContainer(this.containerName);
     const jobDir = `/data/jobs/${job.id}`;
-    const nativeId = job.native_id || "";
-    const cmd = [
-      `mkdir -p ${jobDir}`,
-      `touch ${jobDir}/slurm.out ${jobDir}/slurm.err`,
-      `tail -n +1 -F ${jobDir}/slurm.out ${jobDir}/slurm.err &`,
-      "TAIL_PID=$!",
-      "trap 'kill $TAIL_PID 2>/dev/null || true' EXIT",
-      nativeId
-        ? [
-          `while true; do`,
-          `  state=$(scontrol show job ${nativeId} 2>/dev/null | tr ' ' '\\n' | awk -F= '/^JobState=/{print $2; exit}')`,
-          `  case "$state" in`,
-          `    PENDING|CONFIGURING|RUNNING|COMPLETING|SUSPENDED|"") sleep 1 ;;`,
-          `    *) sleep 1; break ;;`,
-          `  esac`,
-          `  kill -0 $TAIL_PID 2>/dev/null || break`,
-          `done`,
-        ].join(" ")
-        : "while kill -0 $TAIL_PID 2>/dev/null; do sleep 1; done",
-      "kill $TAIL_PID 2>/dev/null || true",
-      "wait $TAIL_PID 2>/dev/null || true",
-    ].join("; ");
+    const nativeId = /^\d+$/.test(String(job.native_id || "")) ? String(job.native_id) : "";
+    // Newlines required: joining a while/case with "; " produces `do;` which bash rejects.
+    const waitLoop = nativeId
+      ? `while true; do
+  state=$(scontrol show job ${nativeId} 2>/dev/null | tr ' ' '\\n' | awk -F= '/^JobState=/{print $2; exit}')
+  case "$state" in
+    PENDING|CONFIGURING|RUNNING|COMPLETING|SUSPENDED|"") sleep 1 ;;
+    *) sleep 1; break ;;
+  esac
+  kill -0 "$TAIL_PID" 2>/dev/null || break
+done`
+      : `while kill -0 "$TAIL_PID" 2>/dev/null; do sleep 1; done`;
+    const cmd = `mkdir -p ${jobDir}
+touch ${jobDir}/slurm.out ${jobDir}/slurm.err
+tail -n +1 -F ${jobDir}/slurm.out ${jobDir}/slurm.err &
+TAIL_PID=$!
+trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
+${waitLoop}
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true`;
 
     let inspect;
     try {
@@ -316,14 +320,20 @@ hcp_notify() {
   local body
   body=$(printf '{"job_id":"%s","status":"%s","scheduler":"slurm","native_id":"%s","message":"%s","token":"%s"}' \\
     "$HCP_JOB_ID" "$st" "\${SLURM_JOB_ID:-}" "$msg" "$HCP_EVENT_TOKEN")
-  {
+  local payload host
+  payload=$(
     printf 'POST /api/v1/internal/events HTTP/1.0\\r\\n'
     printf 'Host: %s\\r\\n' "$HCP_CALLBACK_HOST"
     printf 'Content-Type: application/json\\r\\n'
     printf 'Content-Length: %d\\r\\n' "\${#body}"
     printf '\\r\\n'
     printf '%s' "$body"
-  } >/dev/tcp/"$HCP_CALLBACK_HOST"/"$HCP_CALLBACK_PORT" 2>/dev/null || true
+  )
+  for host in "$HCP_CALLBACK_HOST" 172.28.0.1 172.17.0.1; do
+    [ -n "$host" ] || continue
+    printf '%s' "$payload" >/dev/tcp/"$host"/"$HCP_CALLBACK_PORT" 2>/dev/null && return 0
+  done
+  return 0
 }
 trap 'hcp_notify cancelled interrupted' TERM INT
 trap 'hcp_notify failed command_error; exit 1' ERR

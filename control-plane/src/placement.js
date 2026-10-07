@@ -1,4 +1,4 @@
-const { SchedulerName, WorkloadClass } = require("./models");
+const { SchedulerName, WorkloadClass, JobStatus } = require("./models");
 
 const DEFAULT_IMAGES = new Set(["ubuntu:22.04", "ubuntu:24.04", "debian:bookworm-slim"]);
 
@@ -14,6 +14,33 @@ function canFit(spec, inv) {
   if (!inv || !inv.healthy) return false;
   return inv.cpu_idle >= spec.resources.cpu
     && inv.memory_mb_idle >= spec.resources.memory_mb;
+}
+
+/** Statuses already admitted to a cluster but often missing from a live health() snapshot. */
+const IN_FLIGHT_STATUSES = new Set([JobStatus.ACCEPTED, JobStatus.PENDING]);
+
+/**
+ * Subtract already-admitted jobs from a mutable inventory snapshot.
+ * Live health() lags (pods not scheduled yet, Slurm still PENDING), so a burst
+ * of submits would all see "idle" and skip the control-plane queue.
+ */
+function applyClaims(inventories, jobs) {
+  if (!inventories || !jobs) return inventories;
+  const byName = {};
+  for (const inv of inventories) {
+    if (inv && inv.scheduler) byName[inv.scheduler] = inv;
+  }
+  for (const job of jobs) {
+    if (!job || !IN_FLIGHT_STATUSES.has(job.status) || !job.scheduler) continue;
+    const res = job.spec && job.spec.resources;
+    if (!res) continue;
+    const inv = byName[job.scheduler];
+    if (!inv) continue;
+    inv.cpu_idle = Math.max((inv.cpu_idle || 0) - res.cpu, 0);
+    inv.memory_mb_idle = Math.max((inv.memory_mb_idle || 0) - res.memory_mb, 0);
+    inv.pending_jobs = (inv.pending_jobs || 0) + 1;
+  }
+  return inventories;
 }
 
 function place(spec, inventories) {
@@ -138,6 +165,14 @@ function fallbackScheduler(current, inventories) {
   return null;
 }
 
+/** Fallback only when the peer is healthy AND can admit this spec. */
+function fallbackIfFits(current, spec, inventories) {
+  const other = fallbackScheduler(current, inventories);
+  if (!other) return null;
+  const inv = inventories.find((item) => item.scheduler === other);
+  return canFit(spec, inv) ? other : null;
+}
+
 function otherScheduler(name) {
   return name === SchedulerName.KUBERNETES ? SchedulerName.SLURM : SchedulerName.KUBERNETES;
 }
@@ -167,5 +202,7 @@ module.exports = {
   PlacementError,
   place,
   canFit,
+  applyClaims,
   fallbackScheduler,
+  fallbackIfFits,
 };

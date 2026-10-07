@@ -19,7 +19,7 @@ const {
   jobView,
   clusterView,
 } = require("./models");
-const { PlacementError, place, fallbackScheduler } = require("./placement");
+const { PlacementError, place, applyClaims, fallbackIfFits } = require("./placement");
 const { bootstrapStatuses } = require("./bootstrap");
 const { createEventBus } = require("./events");
 const { connectStore } = require("./store");
@@ -34,6 +34,14 @@ const adapters = {
 };
 let store;
 let events;
+let admitChain = Promise.resolve();
+
+/** Serialize admit so two POSTs in the same second cannot both see a full-idle snapshot. */
+function withAdmitLock(fn) {
+  const run = admitChain.then(fn, fn);
+  admitChain = run.then(() => {}, () => {});
+  return run;
+}
 
 function httpError(status, detail) {
   const err = new Error(detail);
@@ -59,7 +67,7 @@ async function requireJob(jobId) {
 
 async function dispatch(job, scheduler, decision, clusterInventories) {
   const order = [scheduler];
-  const fallback = fallbackScheduler(scheduler, clusterInventories);
+  const fallback = fallbackIfFits(scheduler, job.spec, clusterInventories);
   if (fallback) order.push(fallback);
 
   let lastError = null;
@@ -87,6 +95,16 @@ async function dispatch(job, scheduler, decision, clusterInventories) {
       logger.warn(`submit to ${target} failed: ${err.message}`);
     }
   }
+
+  const peer = scheduler === "kubernetes" ? "slurm" : "kubernetes";
+  if (lastError && !fallback) {
+    await events.enqueue(
+      job,
+      `primary submit to ${scheduler} failed; ${peer} has no free capacity; queued`,
+    );
+    return;
+  }
+
   job.status = JobStatus.FAILED;
   job.message = `submit failed on all schedulers: ${lastError && lastError.message}`;
   await store.upsert(job);
@@ -100,12 +118,31 @@ app.get("/api/v1/health", (_req, res) => {
 app.get("/api/v1/clusters", async (_req, res, next) => {
   try {
     const inv = await inventories();
+    const jobs = await store.list();
     const counts = {};
-    for (const job of await store.list()) {
+    const byScheduler = {};
+    for (const job of jobs) {
       counts[job.status] = (counts[job.status] || 0) + 1;
+      if (!job.scheduler) continue;
+      if (!byScheduler[job.scheduler]) byScheduler[job.scheduler] = { running: 0, pending: 0 };
+      if (job.status === JobStatus.RUNNING) byScheduler[job.scheduler].running += 1;
+      if (job.status === JobStatus.PENDING || job.status === JobStatus.ACCEPTED) {
+        byScheduler[job.scheduler].pending += 1;
+      }
     }
     res.json({
-      clusters: inv.map(clusterView),
+      clusters: inv.map((item) => {
+        const view = clusterView(item);
+        const ours = byScheduler[view.scheduler];
+        if (ours) {
+          view.running_jobs = ours.running;
+          view.pending_jobs = ours.pending;
+        } else {
+          view.running_jobs = 0;
+          view.pending_jobs = 0;
+        }
+        return view;
+      }),
       jobs: counts,
     });
   } catch (err) {
@@ -118,15 +155,21 @@ app.post("/api/v1/jobs", async (req, res, next) => {
   try {
     const spec = parseJobSpec(req.body || {});
     job = await store.upsert(newJobRecord(spec));
-    const clusterInventories = await inventories();
-    const decision = place(spec, clusterInventories);
+    await withAdmitLock(async () => {
+      const clusterInventories = await inventories();
+      applyClaims(clusterInventories, await store.active());
+      const decision = place(spec, clusterInventories);
 
-    if (decision.queue) {
-      await events.enqueue(job, decision.reason);
+      if (decision.queue) {
+        await events.enqueue(job, decision.reason);
+        return;
+      }
+
+      await dispatch(job, decision.scheduler, decision, clusterInventories);
+    });
+    if (job.status === JobStatus.QUEUED) {
       return res.status(202).json(jobView(job));
     }
-
-    await dispatch(job, decision.scheduler, decision, clusterInventories);
     res.status(201).json(jobView(job));
   } catch (err) {
     if (job && job.status !== JobStatus.QUEUED) {

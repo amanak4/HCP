@@ -1,7 +1,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { parseJobSpec, SchedulerName, WorkloadClass } = require("../src/models");
-const { PlacementError, place } = require("../src/placement");
+const { parseJobSpec, SchedulerName, WorkloadClass, JobStatus } = require("../src/models");
+const { PlacementError, place, applyClaims, fallbackIfFits } = require("../src/placement");
 
 function inv(name, healthy, cpu = 4, mem = 2048, running = 0) {
   return {
@@ -103,6 +103,40 @@ test("both clusters busy returns queue decision instead of reject", () => {
   assert.equal(decision.queue, true);
   assert.equal(decision.scheduler, null);
   assert.match(decision.reason, /queued/i);
+});
+
+test("claimed pending jobs make a burst submit queue", () => {
+  const spec = parseJobSpec({
+    name: "burst",
+    command: "sleep 1",
+    resources: { cpu: 2, memory_mb: 256 },
+  });
+  const inventories = [
+    inv(SchedulerName.KUBERNETES, true, 2, 256, 0),
+    inv(SchedulerName.SLURM, true, 2, 256, 0),
+  ];
+  applyClaims(inventories, [
+    { status: JobStatus.PENDING, scheduler: SchedulerName.SLURM, spec },
+    { status: JobStatus.PENDING, scheduler: SchedulerName.KUBERNETES, spec },
+  ]);
+  const decision = place(spec, inventories);
+  assert.equal(decision.queue, true);
+  assert.match(decision.reason, /queued/i);
+});
+
+test("fallback is skipped when the peer cannot fit", () => {
+  const spec = parseJobSpec({
+    name: "heavy",
+    command: "sleep 1",
+    resources: { cpu: 1, memory_mb: 3281 },
+  });
+  const inventories = [
+    inv(SchedulerName.KUBERNETES, true, 8, 0, 5),
+    inv(SchedulerName.SLURM, true, 4, 1000, 0),
+  ];
+  assert.equal(fallbackIfFits(SchedulerName.SLURM, spec, inventories), null);
+  const decision = place(spec, inventories);
+  assert.equal(decision.queue, true);
 });
 
 test("places on the cluster that still has capacity", () => {
