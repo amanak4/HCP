@@ -37,13 +37,17 @@ class KubernetesAdapter {
       if (KUBECONFIG) {
         kc.loadFromFile(KUBECONFIG);
       } else {
-        try {
+        // loadFromCluster() does not throw outside a pod. It builds a fake
+        // in-cluster config, so it must not run before the kubeconfig.
+        kc.loadFromDefault();
+        const wanted = K8S_CONTEXT || kc.getCurrentContext();
+        if (!kc.getContextObject(wanted) && process.env.KUBERNETES_SERVICE_HOST) {
           kc.loadFromCluster();
-        } catch (_err) {
-          kc.loadFromDefault();
         }
       }
-      if (K8S_CONTEXT) kc.setCurrentContext(K8S_CONTEXT);
+      if (K8S_CONTEXT && kc.getContextObject(K8S_CONTEXT)) {
+        kc.setCurrentContext(K8S_CONTEXT);
+      }
       this.kc = kc;
       this.batch = kc.makeApiClient(k8s.BatchV1Api);
       this.core = kc.makeApiClient(k8s.CoreV1Api);

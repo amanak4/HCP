@@ -331,7 +331,9 @@ hcp_notify() {
   )
   for host in "$HCP_CALLBACK_HOST" 172.28.0.1 172.17.0.1; do
     [ -n "$host" ] || continue
-    printf '%s' "$payload" >/dev/tcp/"$host"/"$HCP_CALLBACK_PORT" 2>/dev/null && return 0
+    # Group redirect first: bash reports a failed /dev/tcp open before a
+    # later 2>/dev/null on the same simple command is applied.
+    { printf '%s' "$payload" >/dev/tcp/"$host"/"$HCP_CALLBACK_PORT"; } 2>/dev/null && return 0
   done
   return 0
 }
